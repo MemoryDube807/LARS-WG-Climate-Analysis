@@ -13,4 +13,8 @@ This project automates the processing, ensemble averaging, and visualization of 
 * **Dual-Palette Visualization:** Separates thermal and precipitation regimes into distinct color ramps (graduated blues for rainfall, sequential warm tones for heat) to reduce cognitive load.
 
 ## Outputs
-*(Drag and drop your generated LARSWG_southern_precip_anomalies.png here once uploaded to GitHub)*
+<img width="3600" height="2400" alt="LARSWG_southern_faceted" src="https://github.com/user-attachments/assets/593e8bd5-ff63-4f25-9ab5-62ef85c57398" />
+
+[LARSWG_southern_interactive.html](https://github.com/user-attachments/files/33490439/LARSWG_southern_interactive.html)
+
+<img width="3000" height="1800" alt="LARSWG_southern_overlay" src="https://github.com/user-attachments/assets/1e8f4130-6c16-4476-8a7e-357ea6a28765" />
