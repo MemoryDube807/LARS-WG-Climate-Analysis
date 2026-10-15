@@ -1,0 +1,498 @@
+###############################################################################
+# LARS‑WG 8 Multi‑GCM Ensemble Analyzer – Southern Hemisphere Seasons
+# Professional Portfolio Version
+###############################################################################
+# Clear the environment
+rm(list=ls())
+
+# ============================================================================
+# 1. Load required libraries using pacman
+# ============================================================================
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(seas, dplyr, tidyr, ggplot2, plotly, lubridate, purrr, htmlwidgets, RColorBrewer)
+
+# ============================================================================
+# 2. User settings & Relative Paths
+# ============================================================================
+# Pointing to the relative directories inside the project folder
+WORK_DIR <- "../data"
+OUTPUT_DIR <- "../outputs"
+YEAR_OFFSET <- 1980
+FILE_PATTERN <- "\\.st$"
+OUTPUT_PREFIX <- paste0(OUTPUT_DIR, "/LARSWG_southern")
+
+# Colour settings
+PALETTE_TYPE <- "custom"
+# Thermal scenario palette (Baseline Grey, SSP2-4.5 Oranges, SSP5-8.5 Reds)
+CUSTOM_COLOURS <- c("#999999", "#FDB863", "#E66101", "#F4A582", "#CA0020", "#5E4FA2")
+BREWER_PALETTE <- "Set2"
+
+# Dedicated precipitation color ramp (Baseline Grey -> Graduated Blues)
+precip_colours <- c(
+  "baseline"         = "#999999",
+  "NA_NA"            = "#999999",
+  "ssp245_2021-2040" = "#BDD7E7",
+  "ssp245_2031-2050" = "#6BAED6",
+  "ssp585_2021-2040" = "#3182BD",
+  "ssp585_2031-2050" = "#08519C"
+)
+
+# ============================================================================
+# 3. Helper functions
+# ============================================================================
+
+#' Parse LARS-WG Filename Metadata
+#'
+#' @param fname Character string of the .st filename.
+#' @return A list containing the GCM name, SSP scenario, projection period, and a baseline flag.
+#' @examples
+#' parse_st_filename("mmku_EC-Earth3[r1i1p1f1, ssp245, 2021-2040]WG.st")
+parse_st_filename <- function(fname) {
+  base <- basename(fname)
+  if (grepl("^mmkuWG\\.st$", base)) {
+    return(list(gcm = "baseline", ssp = NA, period = NA, is_baseline = TRUE))
+  } else {
+    core <- sub("^mmku_", "", base)
+    core <- sub("WG\\.st$", "", core)
+    parts <- strsplit(core, "\\[")[[1]]
+    gcm <- parts[1]
+    inside <- gsub("\\]", "", parts[2])
+    info <- strsplit(inside, ",")[[1]]
+    ssp <- trimws(info[2])
+    period <- trimws(info[3])
+    return(list(gcm = gcm, ssp = ssp, period = period, is_baseline = FALSE))
+  }
+}
+
+read_st_file <- function(fname, year.offset = YEAR_OFFSET) {
+  df <- read.lars(fname, year.offset = year.offset)
+  df <- as_tibble(df)
+  df <- df %>%
+    mutate(month = month(date),
+           day = day(date))
+  return(df)
+}
+
+ensemble_mean <- function(df_list) {
+  dates_list <- lapply(df_list, function(df) df$date)
+  if (!all(sapply(dates_list, function(x) identical(x, dates_list[[1]])))) {
+    stop("All data frames must have identical date columns.")
+  }
+  first_df <- df_list[[1]]
+  exclude_cols <- c("date", "year", "yday", "month", "day")
+  numeric_cols <- names(first_df)[sapply(first_df, is.numeric) & 
+                                    !(names(first_df) %in% exclude_cols)]
+  for (i in seq_along(df_list)) {
+    missing <- setdiff(numeric_cols, names(df_list[[i]]))
+    if (length(missing) > 0) {
+      stop(paste("Data frame", i, "is missing columns:", 
+                 paste(missing, collapse = ", ")))
+    }
+  }
+  mat_list <- lapply(df_list, function(df) as.matrix(df[, numeric_cols, drop = FALSE]))
+  arr <- simplify2array(mat_list)
+  mean_mat <- apply(arr, c(1, 2), mean, na.rm = TRUE)
+  ens_df <- as_tibble(mean_mat)
+  names(ens_df) <- numeric_cols
+  ens_df <- ens_df %>%
+    mutate(date = first_df$date,
+           year = year(date),
+           month = month(date),
+           day = day(date))
+  if (all(c("t_max", "t_min") %in% names(ens_df))) {
+    ens_df <- ens_df %>%
+      mutate(t_mean = (t_max + t_min) / 2)
+  }
+  ens_df <- ens_df %>%
+    select(date, year, month, day, everything())
+  return(ens_df)
+}
+
+aggregate_to_monthly <- function(df) {
+  df %>%
+    group_by(year, month) %>%
+    summarise(
+      precip = sum(precip, na.rm = TRUE),
+      t_max  = mean(t_max, na.rm = TRUE),
+      t_min  = mean(t_min, na.rm = TRUE),
+      t_mean = mean(t_mean, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+# Traditional Hydrological Split: NDJ, FMA, MJJ, ASO
+assign_season <- function(month) {
+  case_when(
+    month %in% c(11, 12, 1) ~ "NDJ",
+    month %in% c(2, 3, 4)   ~ "FMA",
+    month %in% c(5, 6, 7)   ~ "MJJ",
+    month %in% c(8, 9, 10)  ~ "ASO",
+    TRUE ~ NA_character_
+  )
+}
+
+aggregate_to_seasonal <- function(df) {
+  df %>%
+    mutate(season = assign_season(month)) %>%
+    filter(!is.na(season)) %>%
+    group_by(year, season) %>%
+    summarise(
+      precip = sum(precip, na.rm = TRUE),
+      t_max  = mean(t_max, na.rm = TRUE),
+      t_min  = mean(t_min, na.rm = TRUE),
+      t_mean = mean(t_mean, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(season = factor(season, levels = c("NDJ", "FMA", "MJJ", "ASO")))
+}
+
+# ============================================================================
+# 4. Main processing function
+# ============================================================================
+process_all_scenarios <- function(dir = WORK_DIR, 
+                                  pattern = FILE_PATTERN, 
+                                  year.offset = YEAR_OFFSET) {
+  # Force R to strictly set the working directory to where the data is
+  # This ensures read.lars() can find BOTH the .st and .dat files
+  old_dir <- getwd()
+  setwd(dir)
+  
+  files <- list.files(pattern = pattern)
+  if (length(files) == 0) {
+    setwd(old_dir)
+    stop("No files found matching pattern ", pattern, " in ", dir)
+  }
+  cat("Found", length(files), "files in", getwd(), "\n")
+  
+  file_info <- tibble(
+    file = files,
+    meta = map(files, parse_st_filename)
+  ) %>%
+    unnest_wider(meta) %>%
+    mutate(scenario_key = ifelse(is_baseline, "baseline", paste(ssp, period, sep = "_"))) %>%
+    mutate(gcm = ifelse(is_baseline, "baseline", gcm))
+  
+  # The critical fix: read.lars now runs while the working directory is explicitly inside the data folder
+  file_info <- file_info %>%
+    mutate(data = map(file, read_st_file, year.offset = year.offset))
+  
+  # Reset the working directory back to the scripts folder after data is loaded
+  setwd(old_dir)
+  
+  scenario_list <- file_info %>%
+    group_by(scenario_key) %>%
+    summarise(
+      gcm_list = list(gcm),
+      data_list = list(data),
+      is_baseline = first(is_baseline),
+      ssp = first(ssp),
+      period = first(period),
+      .groups = "drop"
+    )
+  
+  scenario_ens <- scenario_list %>%
+    mutate(ensemble = map(data_list, ensemble_mean)) %>%
+    select(scenario_key, is_baseline, ssp, period, ensemble)
+  
+  scenario_ens <- scenario_ens %>%
+    mutate(monthly = map(ensemble, aggregate_to_monthly),
+           seasonal = map(ensemble, aggregate_to_seasonal))
+  
+  return(scenario_ens)
+}
+
+# ============================================================================
+# 5. Colour palette generation
+# ============================================================================
+
+get_scenario_colours <- function(scenario_names) {
+  n <- length(scenario_names)
+  if (PALETTE_TYPE == "brewer") {
+    pal <- brewer.pal(min(n, 8), BREWER_PALETTE)
+    if (n > 8) {
+      pal <- colorRampPalette(pal)(n)
+    }
+    names(pal) <- scenario_names
+    return(pal)
+  } else {
+    if (length(CUSTOM_COLOURS) < n) {
+      pal <- colorRampPalette(CUSTOM_COLOURS)(n)
+    } else {
+      pal <- CUSTOM_COLOURS[1:n]
+    }
+    names(pal) <- scenario_names
+    return(pal)
+  }
+}
+
+# ============================================================================
+# 6. Run the analysis
+# ============================================================================
+
+cat("Starting LARS‑WG analysis (Southern Hemisphere seasons)...\n")
+results <- process_all_scenarios()
+
+# Ensure the output directory exists
+if (!dir.exists(OUTPUT_DIR)) {
+  dir.create(OUTPUT_DIR, recursive = TRUE)
+}
+# Switch back to the script directory (or original working directory) for saving
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+# Extract ensemble data frames
+ens_data <- results %>%
+  select(scenario_key, ensemble) %>%
+  unnest(ensemble)
+
+# Monthly summaries
+monthly_data <- results %>%
+  select(scenario_key, monthly) %>%
+  unnest(monthly)
+
+# Seasonal summaries (yearly values per scenario)
+seasonal_data <- results %>%
+  select(scenario_key, seasonal) %>%
+  unnest(seasonal)
+
+# Monthly climatology (mean over years)
+monthly_clim <- monthly_data %>%
+  group_by(scenario_key, month) %>%
+  summarise(
+    precip_mean = mean(precip, na.rm = TRUE),
+    tmax_mean   = mean(t_max, na.rm = TRUE),
+    tmin_mean   = mean(t_min, na.rm = TRUE),
+    tmean_mean  = mean(t_mean, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(month_abbr = factor(month.abb[month], levels = month.abb))
+
+# Get unique scenario keys for colours
+all_scenarios <- unique(monthly_clim$scenario_key)
+scenario_colours <- get_scenario_colours(all_scenarios)
+cat("Scenario colours:\n")
+print(scenario_colours)
+
+# ============================================================================
+# 7. Generate plots with custom bar colours
+# ============================================================================
+
+# ---------- 7a. Faceted monthly climatology ----------
+p_facet <- ggplot(monthly_clim, aes(x = month_abbr)) +
+  geom_bar(aes(y = precip_mean, fill = scenario_key), 
+           stat = "identity", position = position_dodge(width = 0.9), alpha = 0.8) +
+  geom_line(aes(y = tmax_mean * 5, color = "Tmax", group = scenario_key), 
+            size = 1) +
+  geom_line(aes(y = tmin_mean * 5, color = "Tmin", group = scenario_key), 
+            size = 1, linetype = "dashed") +
+  geom_line(aes(y = tmean_mean * 5, color = "Tmean", group = scenario_key), 
+            size = 1, linetype = "dotted") +
+  scale_y_continuous(
+    "Precipitation (mm)",
+    sec.axis = sec_axis(~ . / 5, name = "Temperature (°C)")
+  ) +
+  scale_fill_manual(name = "Precipitation", values = precip_colours) +
+  scale_color_manual(name = "Temperature", 
+                     values = c("Tmax" = "red", "Tmin" = "blue", "Tmean" = "darkgreen")) +
+  labs(x = "Month", title = "Monthly climatology by scenario") +
+  theme_minimal() +
+  theme(legend.position = "bottom",
+        strip.text = element_text(face = "bold", size = 12)) +
+  facet_wrap(~ scenario_key, ncol = 2)
+
+print(p_facet)
+ggsave(paste0(OUTPUT_PREFIX, "_faceted.png"), p_facet, width = 12, height = 8, dpi = 300)
+
+# ---------- 7b. Overlaid monthly climatology ----------
+p_overlay <- ggplot(monthly_clim, aes(x = month_abbr)) +
+  geom_bar(aes(y = precip_mean, fill = scenario_key), 
+           stat = "identity", position = position_dodge(width = 0.9), alpha = 0.8) +
+  geom_line(aes(y = tmax_mean * 5, color = scenario_key, group = scenario_key), 
+            size = 1) +
+  geom_line(aes(y = tmin_mean * 5, color = scenario_key, group = scenario_key), 
+            size = 1, linetype = "dashed") +
+  scale_y_continuous(
+    "Precipitation (mm)",
+    sec.axis = sec_axis(~ . / 5, name = "Temperature (°C)")
+  ) +
+  scale_fill_manual(name = "Precipitation", values = precip_colours) +
+  scale_color_manual(name = "Scenario", values = scenario_colours) +
+  labs(x = "Month", title = "Monthly climatology – all scenarios") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+print(p_overlay)
+ggsave(paste0(OUTPUT_PREFIX, "_overlay.png"), p_overlay, width = 10, height = 6, dpi = 300)
+
+# ---------- 7c. Interactive plotly with custom colours ----------
+plotly_colours <- scenario_colours
+
+plotly_data <- monthly_clim %>%
+  pivot_longer(
+    cols = c(precip_mean, tmax_mean, tmin_mean, tmean_mean),
+    names_to = "variable",
+    values_to = "value"
+  ) %>%
+  mutate(
+    variable = case_when(
+      variable == "precip_mean" ~ "Precipitation",
+      variable == "tmax_mean"   ~ "Tmax",
+      variable == "tmin_mean"   ~ "Tmin",
+      variable == "tmean_mean"  ~ "Tmean"
+    )
+  )
+
+precip_data <- plotly_data %>% filter(variable == "Precipitation")
+temp_data <- plotly_data %>% filter(variable != "Precipitation")
+
+p_plotly <- plot_ly()
+
+for (sc in unique(precip_data$scenario_key)) {
+  df_sc <- precip_data %>% filter(scenario_key == sc)
+  col <- ifelse(sc %in% names(precip_colours), precip_colours[sc], "grey")
+  p_plotly <- p_plotly %>% add_trace(
+    data = df_sc,
+    x = ~month_abbr,
+    y = ~value,
+    type = 'bar',
+    name = paste(sc, "rain"),
+    marker = list(color = col),
+    hoverinfo = "text",
+    text = ~paste0(sc, "<br>", month_abbr, ": ", round(value, 1), " mm")
+  )
+}
+
+for (var in c("Tmax", "Tmin", "Tmean")) {
+  df_var <- temp_data %>% filter(variable == var)
+  for (sc in unique(df_var$scenario_key)) {
+    df_sc <- df_var %>% filter(scenario_key == sc)
+    col <- ifelse(sc %in% names(plotly_colours), plotly_colours[sc], "grey")
+    p_plotly <- p_plotly %>% add_trace(
+      data = df_sc,
+      x = ~month_abbr,
+      y = ~value * 5,
+      type = 'scatter',
+      mode = 'lines+markers',
+      name = paste(sc, var),
+      line = list(color = col, width = 2),
+      marker = list(color = col, size = 4),
+      yaxis = 'y2',
+      hoverinfo = "text",
+      text = ~paste0(sc, " ", var, "<br>", month_abbr, ": ", round(value, 1), " °C")
+    )
+  }
+}
+
+p_plotly <- p_plotly %>% layout(
+  title = "Monthly climatology – interactive",
+  xaxis = list(title = "Month"),
+  yaxis = list(title = "Precipitation (mm)", side = "left"),
+  yaxis2 = list(title = "Temperature (°C)", overlaying = "y", side = "right"),
+  legend = list(orientation = "h", x = 0.5, y = -0.2)
+)
+
+print(p_plotly)
+htmlwidgets::saveWidget(p_plotly, paste0(OUTPUT_PREFIX, "_interactive.html"))
+
+# ---------- 7d. Seasonal anomalies (future climatology – baseline climatology) ----------
+if (any(results$is_baseline)) {
+  
+  # Compute baseline seasonal climatology (mean over years)
+  baseline_clim <- seasonal_data %>%
+    filter(scenario_key == "baseline") %>%
+    group_by(season) %>%
+    summarise(
+      precip_base = mean(precip, na.rm = TRUE),
+      tmax_base   = mean(t_max, na.rm = TRUE),
+      tmin_base   = mean(t_min, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Compute future seasonal climatology (mean over years for each scenario)
+  future_clim <- seasonal_data %>%
+    filter(scenario_key != "baseline") %>%
+    group_by(scenario_key, season) %>%
+    summarise(
+      precip_future = mean(precip, na.rm = TRUE),
+      tmax_future   = mean(t_max, na.rm = TRUE),
+      tmin_future   = mean(t_min, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  # Join and compute anomalies (one row per future scenario per season)
+  anomalies <- future_clim %>%
+    left_join(baseline_clim, by = "season") %>%
+    mutate(
+      precip_anom = precip_future - precip_base,
+      tmax_anom   = tmax_future - tmax_base,
+      tmin_anom   = tmin_future - tmin_base
+    )
+  
+  # Precipitation anomalies
+  p_anom_precip <- anomalies %>%
+    mutate(season = factor(season, levels = c("NDJ", "FMA", "MJJ", "ASO"))) %>%
+    ggplot(aes(x = season, y = precip_anom, fill = scenario_key)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    scale_fill_manual(name = "Precipitation", values = precip_colours) +
+    labs(x = "Season", y = "Precipitation anomaly (mm)", 
+         title = "Seasonal precipitation anomalies (future – baseline)") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p_anom_precip)
+  ggsave(paste0(OUTPUT_PREFIX, "_precip_anomalies.png"), p_anom_precip, 
+         width = 8, height = 5, dpi = 300)
+  
+  # Temperature anomalies
+  p_anom_temp <- anomalies %>%
+    pivot_longer(cols = c(tmax_anom, tmin_anom), 
+                 names_to = "variable", values_to = "anomaly") %>%
+    mutate(variable = ifelse(variable == "tmax_anom", "Tmax", "Tmin")) %>%
+    mutate(season = factor(season, levels = c("NDJ", "FMA", "MJJ", "ASO"))) %>%
+    ggplot(aes(x = season, y = anomaly, fill = scenario_key)) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.8)) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    facet_wrap(~ variable) +
+    scale_fill_manual(name = "Scenario", values = scenario_colours) +
+    labs(x = "Season", y = "Temperature anomaly (°C)", 
+         title = "Seasonal temperature anomalies (future – baseline)") +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p_anom_temp)
+  ggsave(paste0(OUTPUT_PREFIX, "_temp_anomalies.png"), p_anom_temp, 
+         width = 10, height = 5, dpi = 300)
+  
+  write.csv(anomalies, paste0(OUTPUT_PREFIX, "_seasonal_anomalies.csv"), row.names = FALSE)
+} else {
+  cat("No baseline scenario found; skipping anomaly calculations.\n")
+}
+
+# ============================================================================
+# 8. Export summary tables
+# ============================================================================
+
+write.csv(monthly_data, paste0(OUTPUT_PREFIX, "_monthly_stats.csv"), row.names = FALSE)
+write.csv(seasonal_data, paste0(OUTPUT_PREFIX, "_seasonal_stats.csv"), row.names = FALSE)
+write.csv(monthly_clim, paste0(OUTPUT_PREFIX, "_monthly_climatology.csv"), row.names = FALSE)
+
+cat("\nAll outputs saved with prefix:", OUTPUT_PREFIX, "\n")
+cat("Files generated:\n")
+cat(" -", paste0(OUTPUT_PREFIX, "_faceted.png\n"))
+cat(" -", paste0(OUTPUT_PREFIX, "_overlay.png\n"))
+cat(" -", paste0(OUTPUT_PREFIX, "_interactive.html\n"))
+cat(" -", paste0(OUTPUT_PREFIX, "_monthly_stats.csv\n"))
+cat(" -", paste0(OUTPUT_PREFIX, "_seasonal_stats.csv\n"))
+cat(" -", paste0(OUTPUT_PREFIX, "_monthly_climatology.csv\n"))
+if (exists("anomalies")) {
+  cat(" -", paste0(OUTPUT_PREFIX, "_seasonal_anomalies.csv\n"))
+  cat(" -", paste0(OUTPUT_PREFIX, "_precip_anomalies.png\n"))
+  cat(" -", paste0(OUTPUT_PREFIX, "_temp_anomalies.png\n"))
+}
+
+# ============================================================================
+# 9. Session info
+# ============================================================================
+sessionInfo()
+
+# End of script
